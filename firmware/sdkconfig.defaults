@@ -1,0 +1,20 @@
+# Console on UART0 (CH340 USB-serial on the CYD board).
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# Main task stack: surface scan + decode tables need headroom.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Higher CPU clock for benchmarks.
+CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# We talk to the SD card ourselves; don't let the watchdog trip on long scans.
+CONFIG_ESP_TASK_WDT_INIT=n
+
+# Keep optimisation reasonable.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Custom partition table (single large app partition).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
