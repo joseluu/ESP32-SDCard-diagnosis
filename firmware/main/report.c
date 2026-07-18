@@ -153,6 +153,56 @@ void report_bench_human(const bench_result_t *b)
         printf("  ** BENCH ABORTED  : card stopped responding — failed card. **\n");
 }
 
+void report_probe_human(const probe_result_t *p)
+{
+    printf("\n=== QUICK HEALTH PROBE ===\n");
+    for (int i = 0; i < DIAG_PROBE_INIT_CYCLES; i++) {
+        if (p->init_err[i] == ESP_OK)
+            printf("  Bring-up #%d      : OK    (%lu ms)\n",
+                   i + 1, (unsigned long)p->init_ms[i]);
+        else
+            printf("  Bring-up #%d      : FAIL  %s (%lu ms)\n",
+                   i + 1, esp_err_to_name(p->init_err[i]),
+                   (unsigned long)p->init_ms[i]);
+    }
+    if (!p->card_usable) {
+        printf("  VERDICT          : ** CARD IS BAD — cannot complete bring-up **\n");
+        return;
+    }
+    for (int i = 0; i < p->points; i++) {
+        if (p->err[i] == ESP_OK)
+            printf("  LBA %10lu   : OK    (%lu ms)\n",
+                   (unsigned long)p->lba[i], (unsigned long)p->ms[i]);
+        else
+            printf("  LBA %10lu   : FAIL  %s (%lu ms)\n",
+                   (unsigned long)p->lba[i], esp_err_to_name(p->err[i]),
+                   (unsigned long)p->ms[i]);
+    }
+    if (p->burst_ok)
+        printf("  Burst read       : OK    %.2f MB/s over %lu KiB\n",
+               p->burst_mbps, (unsigned long)p->burst_kb);
+    else
+        printf("  Burst read       : FAIL  at LBA %lu (%lu KiB read, %.2f MB/s)\n",
+               (unsigned long)p->burst_fail_lba,
+               (unsigned long)p->burst_kb, p->burst_mbps);
+    if (p->status_ok)
+        printf("  CMD13            : 0x%08lx, %d error flag(s)\n",
+               (unsigned long)p->status, p->status_errs);
+    else
+        printf("  CMD13            : no answer\n");
+
+    bool bad = p->init_fails || p->fails || !p->burst_ok ||
+               p->status_errs || !p->status_ok;
+    if (!bad) {
+        printf("  VERDICT          : card passes (bring-up stable, reads OK)\n");
+    } else {
+        printf("  VERDICT          : ** CARD IS BAD —%s%s%s **\n",
+               p->init_fails ? " intermittent bring-up" : "",
+               (p->fails || !p->burst_ok) ? " read failures" : "",
+               (p->status_errs || !p->status_ok) ? " status errors" : "");
+    }
+}
+
 void report_init_failure_human(const sd_hal_t *h)
 {
     printf("\n=== CARD BRING-UP FAILED ===\n");

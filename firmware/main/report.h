@@ -8,9 +8,10 @@
 void report_identity_human(const sd_hal_t *h, const sd_decoded_t *d);
 void report_caps_human(const sd_decoded_t *d);
 
-// Surface scan / benchmark results.
+// Surface scan / benchmark / quick-probe results.
 void report_scan_human(const scan_result_t *s);
 void report_bench_human(const bench_result_t *b);
+void report_probe_human(const probe_result_t *p);
 
 // Single JSON document with every decoded field (machine consumption).
 void report_json(const sd_hal_t *h, const sd_decoded_t *d);

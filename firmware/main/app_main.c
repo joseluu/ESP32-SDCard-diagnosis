@@ -50,6 +50,7 @@ static void cmd_help(void)
       "  status   CMD13 card status + decoded error flags\n"
       "  scan     read-only surface scan (whole card, per-region speed/errors)\n"
       "  bench    read-only sequential + random read benchmark\n"
+      "  sniff    quick health check: fresh bring-up + spot reads + verdict\n"
       "  json     full machine-readable JSON document\n"
       "  reinit   re-attempt card bring-up\n"
 #if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
@@ -163,6 +164,18 @@ static void cmd_reinit(void)
     else           { report_init_failure_human(&s_hal); }
 }
 
+static void cmd_sniff(void)
+{
+    printf("\nSniff test: bring-up cycles + spot reads + burst read...\n");
+    probe_result_t res;
+    esp_err_t e = diag_quick_probe(&s_hal, &res);
+    s_card_ok = s_hal.initialized;
+    refresh_decode();
+    if (e != ESP_OK) { printf("probe error: %s\n", esp_err_to_name(e)); return; }
+    report_probe_human(&res);
+    if (!res.card_usable) report_init_failure_human(&s_hal);
+}
+
 // ---- dispatch -------------------------------------------------------------
 
 static void dispatch(char *line)
@@ -180,6 +193,7 @@ static void dispatch(char *line)
     else if (!strcmp(line, "status")) cmd_status();
     else if (!strcmp(line, "scan"))   cmd_scan();
     else if (!strcmp(line, "bench"))  cmd_bench();
+    else if (!strcmp(line, "sniff"))  cmd_sniff();
     else if (!strcmp(line, "json"))   cmd_json();
     else if (!strcmp(line, "reinit")) cmd_reinit();
 #if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE

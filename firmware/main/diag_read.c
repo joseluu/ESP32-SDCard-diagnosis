@@ -43,6 +43,78 @@ int diag_cmd13_errors(uint32_t status, char *names, int names_len)
     return count;
 }
 
+esp_err_t diag_quick_probe(sd_hal_t *h, probe_result_t *res)
+{
+    memset(res, 0, sizeof(*res));
+    res->burst_fail_lba = 0xFFFFFFFF;
+
+    // 1) Repeated timed bring-up. An intermittent controller — the classic
+    //    failed-card signature — is caught by cycling init, not by one try.
+    for (int i = 0; i < DIAG_PROBE_INIT_CYCLES; i++) {
+        if (h->initialized || h->backend) sd_hal_deinit(h);
+        int64_t t0 = esp_timer_get_time();
+        res->init_err[i] = sd_hal_init(h);
+        res->init_ms[i] = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+        if (res->init_err[i] != ESP_OK) res->init_fails++;
+    }
+    res->card_usable = h->initialized;
+    if (!res->card_usable) return ESP_OK;    // caller reports the init failure
+
+    uint32_t chunk = SDDIAG_SCAN_CHUNK_SECTORS;
+    uint8_t *buf = NULL;
+    while (chunk >= 16 && !(buf = heap_caps_malloc(chunk * 512, MALLOC_CAP_DMA)))
+        chunk /= 2;
+    if (!buf) return ESP_ERR_NO_MEM;
+
+    // 2) Spot reads across the address space.
+    uint64_t total = h->card.csd.capacity;                 // sectors
+    uint32_t last = total ? (uint32_t)(total - 1) : 0;
+    const uint32_t lbas[DIAG_PROBE_POINTS] = {
+        0,
+        (uint32_t)(total / 4),
+        (uint32_t)(total / 2),
+        (uint32_t)(3 * total / 4),
+        last,
+    };
+    for (int i = 0; i < DIAG_PROBE_POINTS; i++) {
+        res->lba[i] = lbas[i];
+        int64_t t0 = esp_timer_get_time();
+        res->err[i] = sd_hal_read_blocks(h, lbas[i], buf, 1);
+        res->ms[i] = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+        res->points++;
+        if (res->err[i] != ESP_OK) res->fails++;
+    }
+
+    // 3) Sustained sequential burst (4 MiB) — weak flash that survives single
+    //    sectors often trips on a sustained stream.
+    uint32_t goal = 4 * 1024 * 2;                          // sectors
+    if (goal > total) goal = (uint32_t)total;
+    res->burst_ok = true;
+    int64_t b0 = esp_timer_get_time();
+    uint32_t done = 0;
+    while (done < goal) {
+        uint32_t n = (goal - done < chunk) ? (goal - done) : chunk;
+        if (sd_hal_read_blocks(h, done, buf, n) != ESP_OK) {
+            res->burst_ok = false;
+            res->burst_fail_lba = done;
+            break;
+        }
+        done += n;
+    }
+    double bsecs = (esp_timer_get_time() - b0) / 1e6;
+    res->burst_kb = done / 2;
+    if (bsecs > 0 && done > 0)
+        res->burst_mbps = (done * 512.0) / (bsecs * 1e6);
+    heap_caps_free(buf);
+
+    // 4) Card status after the workout.
+    uint32_t st = 0;
+    res->status_ok = (sd_hal_card_status(h, &st) == ESP_OK);
+    res->status = st;
+    if (res->status_ok) res->status_errs = diag_cmd13_errors(st, NULL, 0);
+    return ESP_OK;
+}
+
 static int cmp_double(const void *a, const void *b)
 {
     double da = *(const double *)a, db = *(const double *)b;
@@ -55,9 +127,11 @@ esp_err_t diag_surface_scan(sd_hal_t *h, scan_result_t *res, void (*progress)(in
     memset(res, 0, sizeof(*res));
     res->first_bad_lba = 0xFFFFFFFF;
 
-    const uint32_t chunk = SDDIAG_SCAN_CHUNK_SECTORS;       // sectors per chunk
-    const uint32_t bytes = chunk * 512;
-    uint8_t *buf = heap_caps_malloc(bytes, MALLOC_CAP_DMA);
+    // Degrade the chunk size if DMA heap is tight (the LVGL UI uses some).
+    uint32_t chunk = SDDIAG_SCAN_CHUNK_SECTORS;             // sectors per chunk
+    uint8_t *buf = NULL;
+    while (chunk >= 16 && !(buf = heap_caps_malloc(chunk * 512, MALLOC_CAP_DMA)))
+        chunk /= 2;
     if (!buf) return ESP_ERR_NO_MEM;
 
     uint64_t total = h->card.csd.capacity;                 // sectors
@@ -144,13 +218,17 @@ esp_err_t diag_read_bench(sd_hal_t *h, bench_result_t *res)
     uint64_t total = h->card.csd.capacity;
     if (total < SDDIAG_BENCH_SEQ_SECTORS) return ESP_ERR_INVALID_SIZE;
 
+    // The LVGL UI eats a chunk of DMA-capable heap; degrade the transfer size
+    // rather than fail (same volume read, smaller pieces).
     uint32_t seq = SDDIAG_BENCH_SEQ_SECTORS;
-    uint8_t *buf = heap_caps_malloc(seq * 512, MALLOC_CAP_DMA);
+    uint8_t *buf = NULL;
+    while (seq >= 16 && !(buf = heap_caps_malloc(seq * 512, MALLOC_CAP_DMA)))
+        seq /= 2;
     if (!buf) return ESP_ERR_NO_MEM;
 
-    // Sequential read benchmark (8 x 128 KiB from the start). Stop on first error.
+    // Sequential read benchmark (1 MiB from the start). Stop on first error.
     res->seq_ok = (sd_hal_read_blocks(h, 0, buf, seq) == ESP_OK);  // warm
-    const int reps = 8;
+    const int reps = (8 * SDDIAG_BENCH_SEQ_SECTORS) / seq;
     int good = 0;
     int64_t t0 = esp_timer_get_time();
     for (int i = 0; i < reps; i++) {

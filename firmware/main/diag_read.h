@@ -34,6 +34,42 @@ esp_err_t diag_surface_scan(sd_hal_t *h, scan_result_t *res,
 // Read benchmark: sequential MB/s + random 4 KiB IOPS (read-only).
 esp_err_t diag_read_bench(sd_hal_t *h, bench_result_t *res);
 
+#define DIAG_PROBE_POINTS      5
+#define DIAG_PROBE_INIT_CYCLES 3
+
+typedef struct {
+    // Repeated bring-up cycles (catches intermittent controllers).
+    int       init_fails;
+    uint32_t  init_ms[DIAG_PROBE_INIT_CYCLES];
+    esp_err_t init_err[DIAG_PROBE_INIT_CYCLES];
+    bool      card_usable;               // final bring-up left a working card
+
+    // Spot reads across the address space.
+    int       points;                    // probe reads attempted
+    int       fails;                     // failed reads
+    uint32_t  lba[DIAG_PROBE_POINTS];
+    esp_err_t err[DIAG_PROBE_POINTS];    // ESP_OK or the failure
+    uint32_t  ms[DIAG_PROBE_POINTS];     // per-read latency
+
+    // Sustained sequential burst from LBA 0.
+    bool      burst_ok;
+    uint32_t  burst_kb;                  // volume actually read
+    uint32_t  burst_fail_lba;            // first failing LBA (else 0xFFFFFFFF)
+    double    burst_mbps;
+
+    bool      status_ok;                 // CMD13 answered afterwards
+    uint32_t  status;                    // raw R1 status
+    int       status_errs;               // decoded error-flag count
+} probe_result_t;
+
+// Quick health probe (~5 s). A failed card can serve its identity registers
+// fine, so this exercises what actually breaks: several timed bring-up cycles
+// (intermittent power-up is the classic failed-card signature), single-sector
+// reads spread across the card (start, 25%, 50%, 75%, last), a multi-MiB
+// sequential burst, and CMD13. Re-initialises the card as a side effect; the
+// caller must refresh its decode/card-ok state from h->initialized.
+esp_err_t diag_quick_probe(sd_hal_t *h, probe_result_t *res);
+
 // Decode a CMD13 R1 status word into a count of error flags + a names string.
 // Returns the number of error flags set; fills `names` (caller-sized buffer).
 int diag_cmd13_errors(uint32_t status, char *names, int names_len);

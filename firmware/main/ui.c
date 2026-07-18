@@ -128,18 +128,6 @@ static void fmt_caps(void)
              cmd6->ddr50 ? " DDR50" : "");
 }
 
-static void fmt_cmd13(void)
-{
-    uint32_t st = 0;
-    outf("\n-- Card status (CMD13) --\n");
-    esp_err_t e = sd_hal_card_status(s_ctx.hal, &st);
-    if (e != ESP_OK) { outf("CMD13 failed: %s\n", esp_err_to_name(e)); return; }
-    char names[192];
-    int n = diag_cmd13_errors(st, names, sizeof(names));
-    outf("R1      : 0x%08lx\n", (unsigned long)st);
-    outf("Errors  : %d %s\n", n, n ? names : "(none)");
-}
-
 // Re-check that a supposedly-present card is still there (mutex held). A data
 // read is the only reliable probe: its 0xFE start token can't be faked by a
 // floating MISO line.
@@ -162,14 +150,62 @@ static void run_identify(void)
     fmt_caps();
 }
 
+// Sniff = health check, deliberately NOT repeating Identify's output. A
+// failed card can serve its identity registers fine, so this exercises what
+// actually breaks: repeated timed bring-up cycles (intermittent power-up is
+// the classic failed-card signature), spot reads, a sustained burst read,
+// CMD13, and a verdict.
 static void run_sniff(void)
 {
-    outf("Sniff test (reinit + probes)\n\n");
-    do_reinit();
-    if (!*s_ctx.card_ok) { fmt_init_failure(); return; }
-    fmt_identity();
-    fmt_caps();
-    fmt_cmd13();
+    outf("Sniff test\n\n");
+    probe_result_t p;
+    esp_err_t e = diag_quick_probe(s_ctx.hal, &p);
+    *s_ctx.card_ok = s_ctx.hal->initialized;
+    if (*s_ctx.card_ok) sd_decode_all(&s_ctx.hal->raw, s_ctx.dec);
+    if (e != ESP_OK) { outf("Probe could not run.\n"); return; }
+
+    outf("-- Bring-up x%d --\n", DIAG_PROBE_INIT_CYCLES);
+    for (int i = 0; i < DIAG_PROBE_INIT_CYCLES; i++) {
+        if (p.init_err[i] == ESP_OK)
+            outf("#%d : OK    %lu ms\n", i + 1, (unsigned long)p.init_ms[i]);
+        else
+            outf("#%d : FAIL  %s\n", i + 1, esp_err_to_name(p.init_err[i]));
+    }
+    if (!p.card_usable) {
+        outf("\nVERDICT: CARD IS BAD\n(cannot complete bring-up)\n\n");
+        fmt_init_failure();
+        return;
+    }
+
+    static const char *kPos[DIAG_PROBE_POINTS] =
+        { "start", "25%", "50%", "75%", "end" };
+    outf("\n-- Spot reads --\n");
+    for (int i = 0; i < p.points; i++) {
+        if (p.err[i] == ESP_OK)
+            outf("%-6s: OK    %lu ms\n", kPos[i], (unsigned long)p.ms[i]);
+        else
+            outf("%-6s: FAIL  %s\n", kPos[i], esp_err_to_name(p.err[i]));
+    }
+    if (p.burst_ok)
+        outf("Burst : OK    %.2f MB/s\n        (%lu KiB)\n",
+             p.burst_mbps, (unsigned long)p.burst_kb);
+    else
+        outf("Burst : FAIL  at LBA %lu\n        (%lu KiB read)\n",
+             (unsigned long)p.burst_fail_lba, (unsigned long)p.burst_kb);
+    if (p.status_ok)
+        outf("CMD13 : %d error flag(s)\n", p.status_errs);
+    else
+        outf("CMD13 : no answer\n");
+
+    bool bad = p.init_fails || p.fails || !p.burst_ok ||
+               p.status_errs || !p.status_ok;
+    if (!bad)
+        outf("\nVERDICT: card passes\n(bring-up stable, reads OK)\n");
+    else
+        outf("\nVERDICT: CARD IS BAD\n(%s%s%s)\n",
+             p.init_fails ? "intermittent bring-up " : "",
+             (p.fails || !p.burst_ok) ? "read failures " : "",
+             (p.status_errs || !p.status_ok) ? "status errors" : "");
 }
 
 // ---- UI -------------------------------------------------------------------
@@ -314,8 +350,9 @@ static void build_ui(void)
 #endif
     lv_label_set_text(s_out,
         "Identify : registers + decode\n"
-        "Sniff    : reinit, identity,\n"
-        "           caps, CMD13 status\n\n"
+        "Sniff    : health check —\n"
+        "           fresh bring-up, spot\n"
+        "           reads, verdict\n\n"
         "Destructive tests are serial-only.");
 }
 
