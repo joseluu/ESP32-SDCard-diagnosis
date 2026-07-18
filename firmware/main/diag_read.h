@@ -2,9 +2,21 @@
 #pragma once
 #include "sd_hal.h"
 
+// Progress callback for long tests: percent complete plus the LBA currently
+// being processed (so an interrupted scan can be resumed from that address).
+typedef void (*diag_progress_fn)(int pct, uint32_t lba);
+
+// Ask the running long test (scan / write-verify) to stop cleanly at the next
+// chunk boundary. Safe to call from another task (UI button, console poll).
+void diag_request_stop(void);
+bool diag_stop_requested(void);   // polled by the diag loops
+void diag_stop_clear(void);       // called at the start of each long test
+
 typedef struct {
-    uint64_t total_sectors;
+    uint64_t total_sectors;      // sectors in the scanned range
     uint64_t scanned_sectors;
+    uint32_t start_lba;          // first LBA of the range
+    uint32_t next_lba;           // first LBA NOT processed (resume point)
     uint32_t chunks_total;
     uint32_t chunks_ok;
     uint32_t chunks_failed;
@@ -13,6 +25,7 @@ typedef struct {
     uint32_t first_bad_lba;      // first failing chunk LBA, or 0xFFFFFFFF
     uint32_t cmd13_error_events; // CMD13 statuses with any error flag set
     bool     aborted;            // stopped early because the card wedged
+    bool     stopped;            // stopped early by user request
 } scan_result_t;
 
 typedef struct {
@@ -25,11 +38,14 @@ typedef struct {
     bool     aborted;           // bailed out because the card stopped responding
 } bench_result_t;
 
-// Surface read scan: read the whole card in chunks, time each, count failures
-// and CMD13 error flags. Streams; never buffers the whole card. `progress` (may
-// be NULL) is called periodically with percent complete.
+// Surface read scan over [start_lba, start_lba+count) — count 0 = to the end
+// of the card; start 0 count 0 = whole card. Reads in chunks, times each,
+// counts failures and CMD13 error flags. Streams; never buffers the whole
+// card. `progress` (may be NULL) is called once per chunk. Honours
+// diag_request_stop().
 esp_err_t diag_surface_scan(sd_hal_t *h, scan_result_t *res,
-                            void (*progress)(int pct));
+                            diag_progress_fn progress,
+                            uint32_t start_lba, uint64_t count);
 
 // Read benchmark: sequential MB/s + random 4 KiB IOPS (read-only).
 esp_err_t diag_read_bench(sd_hal_t *h, bench_result_t *res);
@@ -69,6 +85,10 @@ typedef struct {
 // sequential burst, and CMD13. Re-initialises the card as a side effect; the
 // caller must refresh its decode/card-ok state from h->initialized.
 esp_err_t diag_quick_probe(sd_hal_t *h, probe_result_t *res);
+
+// Sequential read speed over 1 MiB (chunked, from LBA 0); used to seed the
+// duration estimates shown before long scans. Returns 0 on failure.
+double diag_quick_read_mbps(sd_hal_t *h);
 
 // Decode a CMD13 R1 status word into a count of error flags + a names string.
 // Returns the number of error flags set; fills `names` (caller-sized buffer).

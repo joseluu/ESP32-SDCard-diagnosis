@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-ESP-IDF firmware that turns a CYD ESP32-2432S032C board into an SD-card diagnosis tool: it sits directly on the SD bus (SPI mode), dumps and decodes every identity register (CID/CSD/SCR/SSR/OCR/CMD6), and runs read benchmarks, surface scans, and (opt-in) destructive write/verify fake-capacity tests. Everything is reported over the USB-serial console via a line-based query language (`info`, `caps`, `status`, `scan`, `bench`, `sniff`, `json`, `reinit`, `wtest`). A standalone LVGL touchscreen UI (`ui.c`, gated by `SDDIAG_UI` in `config.h`) additionally exposes the basic non-destructive functions (Identify, Sniff test) on the board's ST7789 display with GT911 capacitive touch.
+ESP-IDF firmware that turns a CYD ESP32-2432S032C board into an SD-card diagnosis tool: it sits directly on the SD bus (SPI mode), dumps and decodes every identity register (CID/CSD/SCR/SSR/OCR/CMD6), and runs read benchmarks, surface scans, and (opt-in) destructive write/verify fake-capacity tests. Everything is reported over the USB-serial console via a line-based query language (`info`, `caps`, `status`, `scan [lba [n]]`, `bench`, `sniff`, `read <lba> [n]`, `json`, `reinit`, `capcheck`, `wtest`; long tests stop cleanly on any input and can resume via a range scan). A standalone LVGL touchscreen UI (`ui.c`, gated by `SDDIAG_UI` in `config.h`) additionally exposes the basic non-destructive functions (Identify, Sniff test) on the board's ST7789 display with GT911 capacitive touch.
 
 Reference docs at the repo root:
 - `IMPLEMENTATION_PLAN.md` — architecture, module specs, milestones.
@@ -12,12 +12,16 @@ Reference docs at the repo root:
 
 ## Building and flashing
 
-**Critical gotcha:** PlatformIO's ESP-IDF tooling refuses to run under MSYS/Git Bash ("MSys/Mingw is not supported"). Build from PowerShell with `MSYSTEM` unset. `firmware/bp.ps1` handles this (drops MSYSTEM and Git MSYS dirs from PATH):
+**Critical gotcha:** PlatformIO's ESP-IDF tooling refuses to run under MSYS/Git Bash ("MSys/Mingw is not supported"). Build with `MSYSTEM` unset and Git MSYS dirs off PATH. Two wrappers handle this:
 
 ```
+python tools/flash.py           # build+flash the full (destructive) env; works from any shell
+python tools/flash.py --safe    # safe env; --build-only / --boot also available
 pwsh firmware/bp.ps1            # build only (env cyd_esp32)
 pwsh firmware/bp.ps1 upload     # build + flash to COM7
 ```
+
+The board is shared with other projects — `tools/flash.py` is the one-command way to put this firmware back on it.
 
 Direct PlatformIO (from a clean PowerShell, pio at `~/.platformio/penv/Scripts/pio.exe`):
 

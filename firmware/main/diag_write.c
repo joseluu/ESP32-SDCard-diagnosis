@@ -35,22 +35,29 @@ static void fill_sector(uint8_t *p, uint32_t lba)
 #define ABORT_AFTER_CONSEC_FAILS 16
 
 esp_err_t diag_write_verify(sd_hal_t *h, write_result_t *res,
-                            void (*progress)(int))
+                            diag_progress_fn progress)
 {
     if (!h->initialized) return ESP_ERR_INVALID_STATE;
     memset(res, 0, sizeof(*res));
     res->first_write_fail_lba  = 0xFFFFFFFF;
     res->first_verify_fail_lba = 0xFFFFFFFF;
     res->wrap_detected_lba     = 0xFFFFFFFF;
+    diag_stop_clear();
 
-    const uint32_t chunk = SDDIAG_SCAN_CHUNK_SECTORS;   // 128 sectors / 64 KiB
-    const uint32_t bytes = chunk * 512;
-    uint8_t *wbuf = heap_caps_malloc(bytes, MALLOC_CAP_DMA);
-    uint8_t *rbuf = heap_caps_malloc(bytes, MALLOC_CAP_DMA);
+    // Two buffers; halve the chunk if DMA heap is tight (the LVGL UI uses some).
+    uint32_t chunk = SDDIAG_SCAN_CHUNK_SECTORS;         // 128 sectors / 64 KiB
+    uint8_t *wbuf = NULL, *rbuf = NULL;
+    for (; chunk >= 16; chunk /= 2) {
+        wbuf = heap_caps_malloc(chunk * 512, MALLOC_CAP_DMA);
+        rbuf = heap_caps_malloc(chunk * 512, MALLOC_CAP_DMA);
+        if (wbuf && rbuf) break;
+        heap_caps_free(wbuf); wbuf = NULL;
+        heap_caps_free(rbuf); rbuf = NULL;
+    }
     uint8_t exp[512];
     if (!wbuf || !rbuf) {
-        if (wbuf) heap_caps_free(wbuf);
-        if (rbuf) heap_caps_free(rbuf);
+        heap_caps_free(wbuf);
+        heap_caps_free(rbuf);
         return ESP_ERR_NO_MEM;
     }
 
@@ -59,7 +66,7 @@ esp_err_t diag_write_verify(sd_hal_t *h, write_result_t *res,
     uint64_t nchunks = (total + chunk - 1) / chunk;
 
     // ---- Phase 1: WRITE the whole card -----------------------------------
-    int consec = 0, last_pct = -1;
+    int consec = 0;
     int64_t t0 = esp_timer_get_time();
     for (uint64_t ci = 0; ci < nchunks; ci++) {
         uint32_t lba = (uint32_t)(ci * chunk);
@@ -75,10 +82,8 @@ esp_err_t diag_write_verify(sd_hal_t *h, write_result_t *res,
             consec = 0;
             res->sectors_written += cnt;
         }
-        if (progress) {
-            int pct = (int)((ci + 1) * 50 / nchunks);   // 0..50
-            if (pct != last_pct) { progress(pct); last_pct = pct; }
-        }
+        if (progress) progress((int)((ci + 1) * 50 / nchunks), lba);  // 0..50
+        if (diag_stop_requested()) { res->stopped = true; break; }
     }
     int64_t t1 = esp_timer_get_time();
     double wsecs = (t1 - t0) / 1e6;
@@ -88,7 +93,7 @@ esp_err_t diag_write_verify(sd_hal_t *h, write_result_t *res,
     // ---- Phase 2: READ BACK and verify -----------------------------------
     consec = 0;
     int64_t r0 = esp_timer_get_time();
-    for (uint64_t ci = 0; ci < nchunks; ci++) {
+    for (uint64_t ci = 0; !res->stopped && ci < nchunks; ci++) {
         uint32_t lba = (uint32_t)(ci * chunk);
         uint32_t cnt = chunk;
         if ((uint64_t)lba + cnt > total) cnt = (uint32_t)(total - lba);
@@ -118,10 +123,8 @@ esp_err_t diag_write_verify(sd_hal_t *h, write_result_t *res,
                 }
             }
         }
-        if (progress) {
-            int pct = 50 + (int)((ci + 1) * 50 / nchunks);   // 50..100
-            if (pct != last_pct) { progress(pct); last_pct = pct; }
-        }
+        if (progress) progress(50 + (int)((ci + 1) * 50 / nchunks), lba);
+        if (diag_stop_requested()) { res->stopped = true; break; }
     }
     int64_t r1 = esp_timer_get_time();
     double rsecs = (r1 - r0) / 1e6;
@@ -157,7 +160,10 @@ void report_write_human(const write_result_t *r)
                (unsigned long)r->wrap_detected_lba, (unsigned long)r->wrap_seen_lba);
     }
 
-    bool clean = !r->write_aborted && !r->verify_aborted &&
+    if (r->stopped)
+        printf("  ** STOPPED by user — results are partial. **\n");
+
+    bool clean = !r->stopped && !r->write_aborted && !r->verify_aborted &&
                  r->write_failures == 0 && r->read_failures == 0 &&
                  r->verify_mismatches == 0 &&
                  r->sectors_verified == r->total_sectors;

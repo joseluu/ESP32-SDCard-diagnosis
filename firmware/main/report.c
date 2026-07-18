@@ -121,7 +121,13 @@ void report_caps_human(const sd_decoded_t *d)
 void report_scan_human(const scan_result_t *s)
 {
     printf("\n=== SURFACE READ SCAN (read-only) ===\n");
-    printf("  Total sectors     : %llu\n", (unsigned long long)s->total_sectors);
+    if (s->start_lba)
+        printf("  Range             : LBA %lu + %llu sectors\n",
+               (unsigned long)s->start_lba,
+               (unsigned long long)s->total_sectors);
+    else
+        printf("  Total sectors     : %llu\n",
+               (unsigned long long)s->total_sectors);
     printf("  Chunks ok/failed  : %lu / %lu  (of %lu)\n",
            (unsigned long)s->chunks_ok, (unsigned long)s->chunks_failed,
            (unsigned long)s->chunks_total);
@@ -136,6 +142,9 @@ void report_scan_human(const scan_result_t *s)
     if (s->aborted)
         printf("  ** SCAN ABORTED   : card stopped responding (long run of "
                "read timeouts) — strong sign of a failed flash array. **\n");
+    if (s->stopped)
+        printf("  ** STOPPED by user at LBA %lu — resume with: scan %lu **\n",
+               (unsigned long)s->next_lba, (unsigned long)s->next_lba);
 }
 
 void report_bench_human(const bench_result_t *b)

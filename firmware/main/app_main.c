@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_vfs_dev.h"
 #include "driver/uart.h"
@@ -34,10 +35,49 @@ static bool       s_card_ok = false;
 // Serialises SD access between the serial console and the touchscreen UI.
 static SemaphoreHandle_t s_sd_mutex;
 
-static void scan_progress(int pct)
+// Progress printer for long tests: percentage plus a live countdown
+// extrapolated from elapsed time.
+static int64_t s_prog_t0;
+static int     s_prog_last;
+static bool    s_stop_notified;
+
+static void long_test_begin(double mbps, double bytes_to_process)
 {
-    static int last = -1;
-    if (pct / 10 != last / 10) { printf("  ...%d%%\n", pct); last = pct; }
+    if (mbps > 0) {
+        long t = (long)(bytes_to_process / (mbps * 1e6));
+        printf("Estimated duration: ~%ldh %02ldmin (at %.2f MB/s)\n",
+               t / 3600, (t / 60) % 60, mbps);
+    }
+    s_prog_t0 = esp_timer_get_time();
+    s_prog_last = -1;
+    s_stop_notified = false;
+    uart_flush_input(UART_NUM_0);   // stray input must not instantly stop us
+    printf("Send any character to stop the test cleanly.\n");
+}
+
+static void long_progress(int pct, uint32_t lba)
+{
+    // Called once per chunk: any console input while a long test runs is a
+    // stop request (the line reader is blocked inside the test).
+    size_t pending = 0;
+    uart_get_buffered_data_len(UART_NUM_0, &pending);
+    if (pending > 0 && !s_stop_notified) {
+        uart_flush_input(UART_NUM_0);
+        diag_request_stop();
+        s_stop_notified = true;
+        printf("  Stop requested — finishing current chunk...\n");
+    }
+
+    if (pct / 10 == s_prog_last / 10 && s_prog_last >= 0) return;
+    s_prog_last = pct;
+    if (pct > 0) {
+        double el = (esp_timer_get_time() - s_prog_t0) / 1e6;
+        long r = (long)(el * (100 - pct) / pct);
+        printf("  ...%d%%  LBA %lu  (~%ldh %02ldm %02lds left)\n",
+               pct, (unsigned long)lba, r / 3600, (r / 60) % 60, r % 60);
+    } else {
+        printf("  ...%d%%  LBA %lu\n", pct, (unsigned long)lba);
+    }
 }
 
 // ---- command handlers -----------------------------------------------------
@@ -49,7 +89,8 @@ static void cmd_help(void)
       "  info     register dump + decode (Identity)\n"
       "  caps     SCR/OCR/SSR/CMD6 capability summary\n"
       "  status   CMD13 card status + decoded error flags\n"
-      "  scan     read-only surface scan (whole card, per-region speed/errors)\n"
+      "  scan [lba [n]]  read-only surface scan (whole card, or a range —\n"
+      "           e.g. to resume from the LBA where a stopped scan ended)\n"
       "  bench    read-only sequential + random read benchmark\n"
       "  sniff    quick health check: fresh bring-up + spot reads + verdict\n"
       "  read <lba> [n]  read-only sector read; pinpoints failing ranges\n"
@@ -99,12 +140,25 @@ static void cmd_status(void)
     printf("  Error flags set   : %d  %s\n", n, n ? names : "(none)");
 }
 
-static void cmd_scan(void)
+// `scan` = whole card; `scan <lba> [count]` = range (e.g. to resume after a
+// stop, using the LBA shown by the progress indicator / stop report).
+static void cmd_scan(const char *arg)
 {
     if (!s_card_ok) { printf("No card. Run `reinit`.\n"); return; }
-    printf("\nStarting surface scan (read-only)...\n");
+    unsigned long lba = 0, count = 0;
+    sscanf(arg, "%lu %lu", &lba, &count);
+    if (lba >= s_hal.card.csd.capacity) {
+        printf("start LBA %lu is beyond the card (%lu sectors).\n",
+               lba, (unsigned long)s_hal.card.csd.capacity);
+        return;
+    }
+    double range_bytes = (count ? (double)count
+                                : (double)(s_hal.card.csd.capacity - lba)) * 512.0;
+    printf("\nStarting surface scan (read-only)%s...\n",
+           (lba || count) ? " [range]" : "");
+    long_test_begin(diag_quick_read_mbps(&s_hal), range_bytes);
     scan_result_t res;
-    esp_err_t e = diag_surface_scan(&s_hal, &res, scan_progress);
+    esp_err_t e = diag_surface_scan(&s_hal, &res, long_progress, lba, count);
     if (e != ESP_OK) { printf("scan error: %s\n", esp_err_to_name(e)); return; }
     report_scan_human(&res);
 }
@@ -149,12 +203,6 @@ static void cmd_capcheck(const char *arg)
     report_capchk_human(&res);
 }
 
-static void write_progress(int pct)
-{
-    static int last = -1;
-    if (pct / 10 != last / 10) { printf("  ...%d%%\n", pct); last = pct; }
-}
-
 static void cmd_wtest(const char *arg)
 {
     if (!s_card_ok) { printf("No card. Run `reinit`.\n"); return; }
@@ -169,8 +217,11 @@ static void cmd_wtest(const char *arg)
     }
     printf("\n=== DESTRUCTIVE WRITE/VERIFY (h2testw-style) ===\n");
     printf("Overwriting and verifying the whole card. This takes many minutes.\n");
+    // Write pass (assume ~80% of read speed) + verify pass.
+    long_test_begin(diag_quick_read_mbps(&s_hal),
+                    s_hal.card.csd.capacity * 512.0 * 2.25);
     write_result_t res;
-    esp_err_t e = diag_write_verify(&s_hal, &res, write_progress);
+    esp_err_t e = diag_write_verify(&s_hal, &res, long_progress);
     if (e != ESP_OK) { printf("wtest error: %s\n", esp_err_to_name(e)); return; }
     report_write_human(&res);
 }
@@ -271,7 +322,8 @@ static void dispatch(char *line)
     else if (!strcmp(line, "info"))   cmd_info();
     else if (!strcmp(line, "caps"))   cmd_caps();
     else if (!strcmp(line, "status")) cmd_status();
-    else if (!strcmp(line, "scan"))   cmd_scan();
+    else if (!strncmp(line, "scan", 4) &&
+             (line[4] == '\0' || line[4] == ' ')) cmd_scan(line + 4);
     else if (!strcmp(line, "bench"))  cmd_bench();
     else if (!strcmp(line, "sniff"))  cmd_sniff();
     else if (!strncmp(line, "read ", 5)) cmd_read(line + 5);

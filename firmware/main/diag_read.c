@@ -26,6 +26,12 @@ static const flag_t kCardStatusFlags[] = {
 };
 static const int kNumFlags = sizeof(kCardStatusFlags) / sizeof(kCardStatusFlags[0]);
 
+// User-stop request shared by the long tests (scan and write/verify).
+static volatile bool s_stop_req;
+void diag_request_stop(void)  { s_stop_req = true; }
+bool diag_stop_requested(void) { return s_stop_req; }
+void diag_stop_clear(void)    { s_stop_req = false; }
+
 int diag_cmd13_errors(uint32_t status, char *names, int names_len)
 {
     int count = 0;
@@ -115,17 +121,49 @@ esp_err_t diag_quick_probe(sd_hal_t *h, probe_result_t *res)
     return ESP_OK;
 }
 
+double diag_quick_read_mbps(sd_hal_t *h)
+{
+    if (!h->initialized) return 0;
+    uint32_t chunk = 64;
+    uint8_t *buf = NULL;
+    while (chunk >= 16 && !(buf = heap_caps_malloc(chunk * 512, MALLOC_CAP_DMA)))
+        chunk /= 2;
+    if (!buf) return 0;
+
+    uint64_t total = h->card.csd.capacity;
+    uint32_t goal = 2048;                                  // 1 MiB
+    if (goal > total) goal = (uint32_t)total;
+    uint32_t done = 0;
+    int64_t t0 = esp_timer_get_time();
+    while (done < goal) {
+        uint32_t n = (goal - done < chunk) ? goal - done : chunk;
+        if (sd_hal_read_blocks(h, done, buf, n) != ESP_OK) break;
+        done += n;
+    }
+    double secs = (esp_timer_get_time() - t0) / 1e6;
+    heap_caps_free(buf);
+    return (secs > 0 && done) ? (done * 512.0) / (secs * 1e6) : 0;
+}
+
 static int cmp_double(const void *a, const void *b)
 {
     double da = *(const double *)a, db = *(const double *)b;
     return (da > db) - (da < db);
 }
 
-esp_err_t diag_surface_scan(sd_hal_t *h, scan_result_t *res, void (*progress)(int))
+esp_err_t diag_surface_scan(sd_hal_t *h, scan_result_t *res,
+                            diag_progress_fn progress,
+                            uint32_t start_lba, uint64_t count)
 {
     if (!h->initialized) return ESP_ERR_INVALID_STATE;
     memset(res, 0, sizeof(*res));
     res->first_bad_lba = 0xFFFFFFFF;
+    diag_stop_clear();
+
+    uint64_t card_sectors = h->card.csd.capacity;
+    if (start_lba >= card_sectors) return ESP_ERR_INVALID_ARG;
+    uint64_t total = count ? count : card_sectors - start_lba;   // range length
+    if (start_lba + total > card_sectors) total = card_sectors - start_lba;
 
     // Degrade the chunk size if DMA heap is tight (the LVGL UI uses some).
     uint32_t chunk = SDDIAG_SCAN_CHUNK_SECTORS;             // sectors per chunk
@@ -134,8 +172,9 @@ esp_err_t diag_surface_scan(sd_hal_t *h, scan_result_t *res, void (*progress)(in
         chunk /= 2;
     if (!buf) return ESP_ERR_NO_MEM;
 
-    uint64_t total = h->card.csd.capacity;                 // sectors
     res->total_sectors = total;
+    res->start_lba = start_lba;
+    res->next_lba = start_lba;
     uint64_t nchunks = (total + chunk - 1) / chunk;
     res->chunks_total = (uint32_t)nchunks;
 
@@ -147,12 +186,11 @@ esp_err_t diag_surface_scan(sd_hal_t *h, scan_result_t *res, void (*progress)(in
     uint32_t sample_stride = (uint32_t)((nchunks + kMaxSamples - 1) / kMaxSamples);
     if (sample_stride == 0) sample_stride = 1;
 
-    int last_pct = -1;
     int consec_fail = 0;
     for (uint64_t ci = 0; ci < nchunks; ci++) {
-        uint32_t lba = (uint32_t)(ci * chunk);
+        uint32_t lba = (uint32_t)(start_lba + ci * chunk);
         uint32_t this_count = chunk;
-        if ((uint64_t)lba + this_count > total) this_count = (uint32_t)(total - lba);
+        if (ci * chunk + this_count > total) this_count = (uint32_t)(total - ci * chunk);
 
         int64_t t0 = esp_timer_get_time();
         esp_err_t e = sd_hal_read_blocks(h, lba, buf, this_count);
@@ -184,10 +222,9 @@ esp_err_t diag_surface_scan(sd_hal_t *h, scan_result_t *res, void (*progress)(in
             }
         }
 
-        if (progress) {
-            int pct = (int)((ci + 1) * 100 / nchunks);
-            if (pct != last_pct) { progress(pct); last_pct = pct; }
-        }
+        res->next_lba = lba + this_count;
+        if (progress) progress((int)((ci + 1) * 100 / nchunks), lba);
+        if (diag_stop_requested()) { res->stopped = true; break; }
     }
 
     if (nsamp > 0) {

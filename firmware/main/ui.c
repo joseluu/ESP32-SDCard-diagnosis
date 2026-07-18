@@ -23,6 +23,7 @@
 #include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_timer.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -42,8 +43,10 @@ static const char *TAG = "ui";
 typedef enum {
     UI_CMD_IDENTIFY,
     UI_CMD_SNIFF,
+    UI_CMD_SCAN,
 #if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
     UI_CMD_CAPCHECK,
+    UI_CMD_WTEST,
 #endif
 } ui_cmd_t;
 
@@ -135,6 +138,62 @@ static void fmt_caps(void)
              cmd6->ddr50 ? " DDR50" : "");
 }
 
+// ---- long-test progress (upfront estimate + live countdown) ---------------
+
+static char    s_prog_title[160];
+static int64_t s_prog_start;
+static int     s_prog_pct;
+static int64_t s_prog_shown;         // last label refresh
+static volatile bool s_busy;         // a command is running in the worker
+
+// Compose the header shown before and during a long test: capacity, measured
+// speed and the estimated duration. `factor` scales the volume (2.25 for
+// write+verify: a slower write pass plus a full read pass).
+static void progress_begin(const char *name, double factor)
+{
+    double mbps = diag_quick_read_mbps(s_ctx.hal);
+    double bytes = s_ctx.hal->card.csd.capacity * 512.0;
+    if (mbps > 0) {
+        long t = (long)(bytes * factor / (mbps * 1e6));
+        snprintf(s_prog_title, sizeof(s_prog_title),
+                 "%s\n%.2f GB @ %.2f MB/s\nestimated ~ %ldh %02ldmin",
+                 name, bytes / 1e9, mbps, t / 3600, (t / 60) % 60);
+    } else {
+        snprintf(s_prog_title, sizeof(s_prog_title), "%s", name);
+    }
+    s_prog_start = esp_timer_get_time();
+    s_prog_pct = -1;
+    s_prog_shown = 0;
+    if (lvgl_port_lock(0)) {
+        lv_label_set_text_fmt(s_out,
+            "%s\n\nstarting...\n\n(press any button to stop)", s_prog_title);
+        lvgl_port_unlock();
+    }
+}
+
+// Called once per chunk; refresh the label on pct change or every 2 s (so the
+// LBA keeps moving even within one percent of a big card).
+static void progress_cb(int pct, uint32_t lba)
+{
+    int64_t now = esp_timer_get_time();
+    if (pct == s_prog_pct && now - s_prog_shown < 2 * 1000000LL) return;
+    s_prog_pct = pct;
+    s_prog_shown = now;
+    char rem[40] = "estimating time left...";
+    if (pct > 0) {
+        double el = (now - s_prog_start) / 1e6;
+        long r = (long)(el * (100 - pct) / pct);
+        snprintf(rem, sizeof(rem), "~ %ldh %02ldm %02lds left",
+                 r / 3600, (r / 60) % 60, r % 60);
+    }
+    if (lvgl_port_lock(50)) {
+        lv_label_set_text_fmt(s_out,
+            "%s\n\nprogress: %d %%\nLBA %lu\n%s\n\n(press any button to stop)",
+            s_prog_title, pct, (unsigned long)lba, rem);
+        lvgl_port_unlock();
+    }
+}
+
 // Re-check that a supposedly-present card is still there (mutex held). A data
 // read is the only reliable probe: its 0xFE start token can't be faked by a
 // floating MISO line.
@@ -215,7 +274,87 @@ static void run_sniff(void)
              (p.status_errs || !p.status_ok) ? "status errors" : "");
 }
 
+// Full read-only surface scan (reads every sector — hours on a big card over
+// SPI, hence the upfront estimate and countdown).
+static void run_scan(void)
+{
+    card_recheck();
+    if (!*s_ctx.card_ok) do_reinit();
+    if (!*s_ctx.card_ok) { fmt_init_failure(); return; }
+
+    progress_begin("Surface scan (read-only)", 1.0);
+    scan_result_t r;
+    esp_err_t e = diag_surface_scan(s_ctx.hal, &r, progress_cb, 0, 0);
+    if (e != ESP_OK) { outf("scan error: %s\n", esp_err_to_name(e)); return; }
+
+    outf("Surface scan %s\n\n", r.stopped ? "STOPPED" : "done");
+    outf("Scanned : %llu/%llu sect\n",
+         (unsigned long long)r.scanned_sectors,
+         (unsigned long long)r.total_sectors);
+    outf("Chunks  : %lu ok, %lu bad\n",
+         (unsigned long)r.chunks_ok, (unsigned long)r.chunks_failed);
+    outf("Speed   : %.2f / %.2f / %.2f\n  MB/s (min/med/max)\n",
+         r.min_mbps, r.median_mbps, r.max_mbps);
+    outf("Slow rgn: %lu\n", (unsigned long)r.slow_regions);
+    if (r.first_bad_lba != 0xFFFFFFFF)
+        outf("1st bad : LBA %lu\n", (unsigned long)r.first_bad_lba);
+    outf("CMD13 ev: %lu\n", (unsigned long)r.cmd13_error_events);
+    if (r.aborted)
+        outf("\nABORTED: card wedged during scan\n");
+    if (r.stopped)
+        outf("\nStopped at LBA %lu\nresume: serial `scan %lu`\n",
+             (unsigned long)r.next_lba, (unsigned long)r.next_lba);
+
+    if (r.chunks_failed == 0 && !r.aborted)
+        outf("\nVERDICT: %s\n", r.stopped
+             ? "scanned part reads OK" : "whole surface reads OK");
+    else
+        outf("\nVERDICT: CARD IS BAD\n(unreadable regions)\n");
+}
+
 #if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
+// Full destructive write/verify (h2testw-style) — the definitive test.
+static void run_wtest(void)
+{
+    card_recheck();
+    if (!*s_ctx.card_ok) do_reinit();
+    if (!*s_ctx.card_ok) { fmt_init_failure(); return; }
+
+    progress_begin("Scan write (DESTRUCTIVE)", 2.25);
+    write_result_t r;
+    esp_err_t e = diag_write_verify(s_ctx.hal, &r, progress_cb);
+    if (e != ESP_OK) { outf("wtest error: %s\n", esp_err_to_name(e)); return; }
+
+    outf("Scan write %s\n\n", r.stopped ? "STOPPED (partial)" : "done");
+    outf("Written : %llu/%llu sect\n",
+         (unsigned long long)r.sectors_written,
+         (unsigned long long)r.total_sectors);
+    outf("Verified: %llu sect\n", (unsigned long long)r.sectors_verified);
+    outf("Speed   : %.2f w / %.2f r MB/s\n", r.write_mbps, r.read_mbps);
+    if (r.write_failures)   outf("Write errs : %lu (1st LBA %lu)\n",
+        (unsigned long)r.write_failures, (unsigned long)r.first_write_fail_lba);
+    if (r.verify_mismatches) outf("Mismatches : %lu (1st LBA %lu)\n",
+        (unsigned long)r.verify_mismatches, (unsigned long)r.first_verify_fail_lba);
+    if (r.read_failures)    outf("Read errs  : %lu\n", (unsigned long)r.read_failures);
+    if (r.wrap_detected_lba != 0xFFFFFFFF)
+        outf("FAKE CAPACITY: LBA %lu tagged as %lu\n",
+             (unsigned long)r.wrap_detected_lba, (unsigned long)r.wrap_seen_lba);
+    if (r.write_aborted || r.verify_aborted)
+        outf("\nABORTED: card wedged\n");
+
+    bool clean = !r.stopped && !r.write_aborted && !r.verify_aborted &&
+                 !r.write_failures && !r.read_failures &&
+                 !r.verify_mismatches && r.sectors_verified == r.total_sectors;
+    if (r.stopped)
+        outf("\nVERDICT: none (stopped early)\n");
+    else if (clean)
+        outf("\nVERDICT: PASS\n(full capacity real, all data retained)\n");
+    else
+        outf("\nVERDICT: CARD IS BAD\n%s\n",
+             r.wrap_detected_lba != 0xFFFFFFFF
+                 ? "(fake capacity)" : "(write/verify errors)");
+}
+
 // Capacity check: f3probe-style — writes LBA-tagged probes at powers of two
 // plus the last sector, detects wrap-around/discarded writes, restores the
 // saved content afterwards.
@@ -307,17 +446,21 @@ static void ui_worker(void *arg)
             detect_poll();     // idle: watch for card insertion/removal
             continue;
         }
+        s_busy = true;
         xSemaphoreTake(s_ctx.sd_mutex, portMAX_DELAY);
         s_off = 0;
         s_buf[0] = '\0';
         switch (cmd) {
         case UI_CMD_IDENTIFY: run_identify(); break;
         case UI_CMD_SNIFF:    run_sniff();    break;
+        case UI_CMD_SCAN:     run_scan();     break;
 #if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
         case UI_CMD_CAPCHECK: run_capcheck(); break;
+        case UI_CMD_WTEST:    run_wtest();    break;
 #endif
         }
         xSemaphoreGive(s_ctx.sd_mutex);
+        s_busy = false;
         if (lvgl_port_lock(0)) {
             lv_label_set_text(s_out, s_buf);
             lv_obj_scroll_to_y(lv_obj_get_parent(s_out), 0, LV_ANIM_OFF);
@@ -331,11 +474,37 @@ static void btn_event_cb(lv_event_t *e)
 {
     // Runs in the LVGL task: give instant feedback, then queue the real work.
     ui_cmd_t cmd = (ui_cmd_t)(uintptr_t)lv_event_get_user_data(e);
+    // While a test runs, ANY button is a stop request (the worker is busy, so
+    // queueing more commands would only stack them up).
+    if (s_busy) {
+        diag_request_stop();
+        lv_label_set_text(s_out,
+            "Stop requested —\nfinishing current chunk...");
+        return;
+    }
+#if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
+    // Scan write erases the card: require a second press within 10 s.
+    if (cmd == UI_CMD_WTEST) {
+        static int64_t armed_at = -100000000;
+        int64_t now = esp_timer_get_time();
+        if (now - armed_at > 10 * 1000000LL) {
+            armed_at = now;
+            lv_label_set_text(s_out,
+                "SCAN WRITE is DESTRUCTIVE.\n"
+                "It overwrites the WHOLE card:\n"
+                "ALL DATA WILL BE LOST.\n\n"
+                "Press Scan write again\n"
+                "within 10 s to confirm.");
+            return;
+        }
+        armed_at = -100000000;
+    }
+#endif
     lv_label_set_text(s_out, "Working...");
     xQueueSend(s_cmdq, &cmd, 0);
 }
 
-static void mk_btn(lv_obj_t *parent, const char *txt, ui_cmd_t cmd)
+static lv_obj_t *mk_btn(lv_obj_t *parent, const char *txt, ui_cmd_t cmd)
 {
     lv_obj_t *b = lv_button_create(parent);
     lv_obj_set_flex_grow(b, 1);
@@ -345,6 +514,20 @@ static void mk_btn(lv_obj_t *parent, const char *txt, ui_cmd_t cmd)
     lv_obj_t *l = lv_label_create(b);
     lv_label_set_text(l, txt);
     lv_obj_center(l);
+    return b;
+}
+
+static lv_obj_t *mk_btn_row(lv_obj_t *parent)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, LV_PCT(100), 40);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_style_pad_column(row, 4, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    return row;
 }
 
 static void build_ui(void)
@@ -369,21 +552,22 @@ static void build_ui(void)
     lv_obj_align(s_status, LV_ALIGN_RIGHT_MID, 0, 0);
     update_status_label();
 
-    // Button row.
-    lv_obj_t *row = lv_obj_create(scr);
-    lv_obj_set_size(row, LV_PCT(100), 44);
-    lv_obj_set_style_pad_all(row, 0, 0);
-    lv_obj_set_style_pad_column(row, 4, 0);
-    lv_obj_set_style_border_width(row, 0, 0);
-    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    // Button rows: quick tests, then full-card scans.
+    lv_obj_t *row = mk_btn_row(scr);
     mk_btn(row, "Identify", UI_CMD_IDENTIFY);
 #if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
     mk_btn(row, "Sniff", UI_CMD_SNIFF);
     mk_btn(row, "Capacity", UI_CMD_CAPCHECK);
 #else
     mk_btn(row, "Sniff test", UI_CMD_SNIFF);
+#endif
+
+    lv_obj_t *row2 = mk_btn_row(scr);
+    mk_btn(row2, "Scan", UI_CMD_SCAN);
+#if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
+    // Orange = destructive, to stand apart from the safe buttons.
+    lv_obj_t *bw = mk_btn(row2, "Scan write", UI_CMD_WTEST);
+    lv_obj_set_style_bg_color(bw, lv_palette_main(LV_PALETTE_ORANGE), 0);
 #endif
 
     // Scrollable result area: the whole box is drag-sensitive (the label is
@@ -403,10 +587,18 @@ static void build_ui(void)
 #endif
     lv_label_set_text(s_out,
         "Identify : registers + decode\n"
-        "Sniff    : health check —\n"
-        "           fresh bring-up, spot\n"
-        "           reads, verdict\n\n"
-        "Destructive tests are serial-only.");
+        "Sniff    : quick health check\n"
+        "Scan     : full read of every\n"
+        "           sector (long!)\n"
+#if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
+        "Capacity : fake-size probe\n"
+        "           (writes + restores)\n"
+        "Scan write: DESTRUCTIVE full\n"
+        "           write+verify\n"
+#else
+        "\nDestructive tests need the\ndestructive build.\n"
+#endif
+    );
 }
 
 // ---- hardware bring-up ----------------------------------------------------

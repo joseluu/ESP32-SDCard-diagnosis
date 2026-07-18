@@ -5,6 +5,7 @@
 // gate it behind an explicit runtime confirmation (see app_main `wtest`).
 #pragma once
 #include "sd_hal.h"
+#include "diag_read.h"   // diag_progress_fn, diag_request_stop
 
 #if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
 
@@ -23,15 +24,17 @@ typedef struct {
     double   read_mbps;
     bool     write_aborted;       // write phase bailed (card wedged)
     bool     verify_aborted;      // verify phase bailed (card wedged)
+    bool     stopped;             // stopped early by user request
 } write_result_t;
 
 // Full-card destructive write/verify (h2testw-style). Writes a deterministic,
 // LBA-tagged pattern over EVERY sector, then reads the whole card back and
 // verifies. Detects write corruption, dead sectors, and fake-capacity wrap
 // (a high sector returning data tagged with a different/lower LBA). `progress`
-// (may be NULL) is called with 0..100 (0..50 = write, 50..100 = verify).
+// (may be NULL) is called per chunk with 0..100 (0..50 = write, 50..100 =
+// verify) and the current LBA. Honours diag_request_stop().
 esp_err_t diag_write_verify(sd_hal_t *h, write_result_t *res,
-                            void (*progress)(int pct));
+                            diag_progress_fn progress);
 
 // Human-readable verdict for a write/verify run.
 void report_write_human(const write_result_t *r);
