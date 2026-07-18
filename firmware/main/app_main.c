@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_vfs_dev.h"
 #include "driver/uart.h"
 #include "driver/uart_vfs.h"
@@ -51,9 +52,11 @@ static void cmd_help(void)
       "  scan     read-only surface scan (whole card, per-region speed/errors)\n"
       "  bench    read-only sequential + random read benchmark\n"
       "  sniff    quick health check: fresh bring-up + spot reads + verdict\n"
+      "  read <lba> [n]  read-only sector read; pinpoints failing ranges\n"
       "  json     full machine-readable JSON document\n"
       "  reinit   re-attempt card bring-up\n"
 #if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
+      "  capcheck fake-capacity probe (writes+restores ~25 sectors; needs `capcheck WRITE`)\n"
       "  wtest    DESTRUCTIVE full write/verify (overwrites card; needs `wtest DESTROY`)\n"
 #endif
       "  help     this message\n"
@@ -127,6 +130,25 @@ static void cmd_json(void)
 }
 
 #if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
+static void cmd_capcheck(const char *arg)
+{
+    if (!s_card_ok) { printf("No card. Run `reinit`.\n"); return; }
+    while (*arg == ' ') arg++;
+    if (strcmp(arg, "WRITE") != 0) {
+        printf("\n*** Capacity check (f3probe-style) ***\n");
+        printf("Backs up ~25 sectors, writes LBA-tagged patterns to a dozen probe\n");
+        printf("points (powers of two + the last sector), detects address wrap-around\n");
+        printf("and discarded writes, then RESTORES the saved content. Data is only\n");
+        printf("at risk if power fails mid-test. To proceed, run:  capcheck WRITE\n");
+        return;
+    }
+    printf("\nRunning capacity check...\n");
+    capchk_result_t res;
+    esp_err_t e = diag_capacity_check(&s_hal, &res);
+    if (e != ESP_OK) { printf("capcheck error: %s\n", esp_err_to_name(e)); return; }
+    report_capchk_human(&res);
+}
+
 static void write_progress(int pct)
 {
     static int last = -1;
@@ -153,6 +175,64 @@ static void cmd_wtest(const char *arg)
     report_write_human(&res);
 }
 #endif
+
+// `read <lba> [count]` — read-only diagnostic read of an arbitrary range.
+// Chunked; failing chunks are narrowed to exact sectors, but only for the
+// first few (dead-sector reads each burn a full timeout, so narrowing a huge
+// bad region would take forever) — beyond that, whole chunks are reported.
+static void cmd_read(const char *arg)
+{
+    if (!s_card_ok) { printf("No card. Run `reinit`.\n"); return; }
+    unsigned long lba = 0, count = 1;
+    if (sscanf(arg, "%lu %lu", &lba, &count) < 1) {
+        printf("usage: read <lba> [count]\n");
+        return;
+    }
+    if (count == 0) count = 1;
+
+    uint32_t chunk = 64;
+    uint8_t *buf = NULL;
+    while (chunk >= 1 && !(buf = heap_caps_malloc(chunk * 512, MALLOC_CAP_DMA)))
+        chunk /= 2;
+    if (!buf) { printf("out of memory\n"); return; }
+
+    printf("Reading %lu sector(s) from LBA %lu (read-only)...\n", count, lba);
+    unsigned long bad = 0, in_bad_since = 0;
+    bool in_bad = false;
+    int narrow_budget = 2;                 // failing chunks narrowed per-sector
+    for (unsigned long off = 0; off < count; ) {
+        uint32_t n = (count - off < chunk) ? (uint32_t)(count - off) : chunk;
+        if (sd_hal_read_blocks(&s_hal, lba + off, buf, n) == ESP_OK) {
+            if (in_bad) {
+                printf("  BAD %lu..%lu\n", in_bad_since, lba + off - 1);
+                in_bad = false;
+            }
+            off += n;
+            continue;
+        }
+        if (narrow_budget > 0) {
+            narrow_budget--;
+            for (uint32_t k = 0; k < n; k++) {
+                if (sd_hal_read_blocks(&s_hal, lba + off + k, buf, 1) == ESP_OK) {
+                    if (in_bad) {
+                        printf("  BAD %lu..%lu\n", in_bad_since, lba + off + k - 1);
+                        in_bad = false;
+                    }
+                } else {
+                    bad++;
+                    if (!in_bad) { in_bad = true; in_bad_since = lba + off + k; }
+                }
+            }
+        } else {
+            bad += n;                       // count the whole chunk as bad
+            if (!in_bad) { in_bad = true; in_bad_since = lba + off; }
+        }
+        off += n;
+    }
+    if (in_bad) printf("  BAD %lu..%lu\n", in_bad_since, lba + count - 1);
+    printf("Done: %lu/%lu sector(s) failed.\n", bad, count);
+    heap_caps_free(buf);
+}
 
 static void cmd_reinit(void)
 {
@@ -194,9 +274,11 @@ static void dispatch(char *line)
     else if (!strcmp(line, "scan"))   cmd_scan();
     else if (!strcmp(line, "bench"))  cmd_bench();
     else if (!strcmp(line, "sniff"))  cmd_sniff();
+    else if (!strncmp(line, "read ", 5)) cmd_read(line + 5);
     else if (!strcmp(line, "json"))   cmd_json();
     else if (!strcmp(line, "reinit")) cmd_reinit();
 #if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
+    else if (!strncmp(line, "capcheck", 8)) cmd_capcheck(line + 8);
     else if (!strncmp(line, "wtest", 5)) cmd_wtest(line + 5);
 #endif
     else printf("Unknown command '%s'. Type `help`.\n", line);

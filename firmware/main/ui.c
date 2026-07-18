@@ -35,10 +35,17 @@
 #include "ui.h"
 #include "sd_mfg_db.h"
 #include "diag_read.h"
+#include "diag_write.h"
 
 static const char *TAG = "ui";
 
-typedef enum { UI_CMD_IDENTIFY, UI_CMD_SNIFF } ui_cmd_t;
+typedef enum {
+    UI_CMD_IDENTIFY,
+    UI_CMD_SNIFF,
+#if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
+    UI_CMD_CAPCHECK,
+#endif
+} ui_cmd_t;
 
 static ui_ctx_t      s_ctx;
 static lv_display_t *s_disp;
@@ -208,6 +215,44 @@ static void run_sniff(void)
              (p.status_errs || !p.status_ok) ? "status errors" : "");
 }
 
+#if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
+// Capacity check: f3probe-style — writes LBA-tagged probes at powers of two
+// plus the last sector, detects wrap-around/discarded writes, restores the
+// saved content afterwards.
+static void run_capcheck(void)
+{
+    outf("Capacity check\n(writes + restores ~25 sectors)\n\n");
+    card_recheck();
+    if (!*s_ctx.card_ok) do_reinit();
+    if (!*s_ctx.card_ok) { fmt_init_failure(); return; }
+
+    capchk_result_t r;
+    esp_err_t e = diag_capacity_check(s_ctx.hal, &r);
+    if (e != ESP_OK) { outf("capcheck error: %s\n", esp_err_to_name(e)); return; }
+
+    outf("Announced: %.2f GB\n\n-- Probe points --\n",
+         r.announced_sectors * 512.0 / 1e9);
+    static const char *kSt[] = { "OK", "ALIAS", "LOST", "WERR", "RERR" };
+    for (int i = 0; i < r.points; i++) {
+        outf("%9lu: %s", (unsigned long)r.lba[i], kSt[r.state[i]]);
+        if (r.state[i] == CAPCHK_ALIAS)
+            outf(" of %lu", (unsigned long)r.found_lba[i]);
+        outf("\n");
+    }
+    if (r.wrap_detected)
+        outf("Wrap: LBA %lu tag on sector 0\n", (unsigned long)r.wrap_modulus);
+
+    if (r.est_real_sectors)
+        outf("\nVERDICT: FAKE CAPACITY\nreal ~ %.2f GB\n(announced %.2f GB)\n",
+             r.est_real_sectors * 512.0 / 1e9,
+             r.announced_sectors * 512.0 / 1e9);
+    else
+        outf("\nVERDICT: capacity plausible\n(all probes hold data;\nwtest is definitive)\n");
+    outf(r.restore_ok ? "\nOriginal data restored.\n"
+                      : "\nRESTORE INCOMPLETE!\n");
+}
+#endif
+
 // ---- UI -------------------------------------------------------------------
 
 static void update_status_label(void)
@@ -268,6 +313,9 @@ static void ui_worker(void *arg)
         switch (cmd) {
         case UI_CMD_IDENTIFY: run_identify(); break;
         case UI_CMD_SNIFF:    run_sniff();    break;
+#if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
+        case UI_CMD_CAPCHECK: run_capcheck(); break;
+#endif
         }
         xSemaphoreGive(s_ctx.sd_mutex);
         if (lvgl_port_lock(0)) {
@@ -331,7 +379,12 @@ static void build_ui(void)
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
     mk_btn(row, "Identify", UI_CMD_IDENTIFY);
+#if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
+    mk_btn(row, "Sniff", UI_CMD_SNIFF);
+    mk_btn(row, "Capacity", UI_CMD_CAPCHECK);
+#else
     mk_btn(row, "Sniff test", UI_CMD_SNIFF);
+#endif
 
     // Scrollable result area: the whole box is drag-sensitive (the label is
     // not clickable, so presses anywhere fall through to the box and dragging

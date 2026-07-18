@@ -36,4 +36,42 @@ esp_err_t diag_write_verify(sd_hal_t *h, write_result_t *res,
 // Human-readable verdict for a write/verify run.
 void report_write_human(const write_result_t *r);
 
+// ---------------------------------------------------------------------------
+// Capacity check — quasi-non-destructive (f3probe-style backup/restore)
+// ---------------------------------------------------------------------------
+#define CAPCHK_MAX_POINTS 20
+#define CAPCHK_MIN_SHIFT  16          // first probe at 2^16 sectors (32 MiB)
+
+typedef enum {
+    CAPCHK_OK = 0,       // probe sector holds its own tag: flash exists there
+    CAPCHK_ALIAS,        // holds another probe's tag: address wrap-around
+    CAPCHK_LOST,         // written tag vanished: no flash behind this LBA
+    CAPCHK_WRITE_ERR,    // the write command itself failed
+    CAPCHK_READ_ERR,     // the read-back failed
+} capchk_state_t;
+
+typedef struct {
+    uint64_t announced_sectors;
+    int      points;
+    uint32_t lba[CAPCHK_MAX_POINTS];
+    capchk_state_t state[CAPCHK_MAX_POINTS];
+    uint32_t found_lba[CAPCHK_MAX_POINTS];  // tag found there when ALIAS
+    bool     wrap_detected;      // some probe's tag landed on sector 0
+    uint32_t wrap_modulus;       // that probe's LBA ≈ the real size
+    uint64_t est_real_sectors;   // 0 = no upper bound found (looks genuine)
+    bool     restore_ok;         // every saved sector written back intact
+} capchk_result_t;
+
+// Probes whether the announced capacity is real WITHOUT losing data: backs up
+// ~25 sectors (sector 0, power-of-two probe points, the last sector, and the
+// low sectors a wrapped last-sector write could land on), writes an LBA-tagged
+// pattern to each probe, RESETS the card (so the controller cache cannot mask
+// missing flash — f3probe's trick), looks for wrap-around or silently-
+// discarded writes, then restores every backup. Data is only at risk if power
+// fails mid-test or the card dies mid-test. Residual limits: a fake whose real
+// size is not a power of two can evade the probe pattern; wtest is definitive.
+esp_err_t diag_capacity_check(sd_hal_t *h, capchk_result_t *res);
+
+void report_capchk_human(const capchk_result_t *r);
+
 #endif // CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
