@@ -6,6 +6,9 @@ firmware/.pio/
 firmware/sdkconfig.*
 !firmware/sdkconfig.defaults
 
+# IDF managed components (fetched per dependencies.lock at build time)
+firmware/managed_components/
+
 # Editor / OS
 .vscode/
 .DS_Store

@@ -1,0 +1,7 @@
+# Managed components for the touchscreen UI (LVGL over esp_lcd).
+# Fetched by the IDF component manager at build time into managed_components/.
+dependencies:
+  idf: ">=5.3"
+  lvgl/lvgl: "^9.2.0"
+  espressif/esp_lvgl_port: "^2.4.0"
+  espressif/esp_lcd_touch_gt911: "^1.1.0"

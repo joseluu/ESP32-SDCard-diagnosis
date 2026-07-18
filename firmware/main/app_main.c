@@ -11,6 +11,7 @@
 #include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_vfs_dev.h"
 #include "driver/uart.h"
@@ -22,10 +23,15 @@
 #include "diag_read.h"
 #include "diag_write.h"
 #include "report.h"
+#if SDDIAG_UI
+#include "ui.h"
+#endif
 
 static sd_hal_t   s_hal;
 static sd_decoded_t s_dec;
 static bool       s_card_ok = false;
+// Serialises SD access between the serial console and the touchscreen UI.
+static SemaphoreHandle_t s_sd_mutex;
 
 static void scan_progress(int pct)
 {
@@ -167,6 +173,7 @@ static void dispatch(char *line)
     while (end > line && isspace((unsigned char)end[-1])) *--end = '\0';
     if (!*line) return;
 
+    xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
     if      (!strcmp(line, "help"))   cmd_help();
     else if (!strcmp(line, "info"))   cmd_info();
     else if (!strcmp(line, "caps"))   cmd_caps();
@@ -179,6 +186,7 @@ static void dispatch(char *line)
     else if (!strncmp(line, "wtest", 5)) cmd_wtest(line + 5);
 #endif
     else printf("Unknown command '%s'. Type `help`.\n", line);
+    xSemaphoreGive(s_sd_mutex);
 
     printf("\nsd> ");
     fflush(stdout);
@@ -208,9 +216,14 @@ static void console_init(void)
 void app_main(void)
 {
     console_init();
+    s_sd_mutex = xSemaphoreCreateMutex();
 
     printf("\n\n================================================\n");
-    printf(" ESP32 SD-Card Diagnosis Tool  (serial, no display)\n");
+#if SDDIAG_UI
+    printf(" ESP32 SD-Card Diagnosis Tool  (serial + touch UI)\n");
+#else
+    printf(" ESP32 SD-Card Diagnosis Tool  (serial only)\n");
+#endif
     printf(" Board: CYD ESP32-2432S032C   Backend: SPI\n");
     printf("================================================\n");
 
@@ -229,6 +242,17 @@ void app_main(void)
         report_init_failure_human(&s_hal);
         printf("\nThe query language is still available; try `reinit`, `info`, or `status`.\n");
     }
+
+#if SDDIAG_UI
+    const ui_ctx_t uctx = {
+        .hal = &s_hal, .dec = &s_dec, .card_ok = &s_card_ok,
+        .sd_mutex = s_sd_mutex,
+    };
+    esp_err_t ue = ui_init(&uctx);
+    if (ue != ESP_OK)
+        printf("Touchscreen UI init failed (%s); serial-only mode.\n",
+               esp_err_to_name(ue));
+#endif
 
     cmd_help();
     printf("\nsd> ");

@@ -18,3 +18,6 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # Custom partition table (single large app partition).
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# LVGL UI: smaller font for the result area (montserrat_14 default stays on).
+CONFIG_LV_FONT_MONTSERRAT_12=y

@@ -7,12 +7,15 @@ idf_component_register(
         "diag_read.c"
         "diag_write.c"
         "report.c"
+        "ui.c"
     INCLUDE_DIRS "."
     REQUIRES
         sdmmc
         esp_driver_sdspi
         esp_driver_gpio
         esp_driver_spi
+        esp_driver_i2c
+        esp_lcd
         esp_timer
         driver
 )

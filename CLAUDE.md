@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-ESP-IDF firmware that turns a CYD ESP32-2432S032C board into an SD-card diagnosis tool: it sits directly on the SD bus (SPI mode), dumps and decodes every identity register (CID/CSD/SCR/SSR/OCR/CMD6), and runs read benchmarks, surface scans, and (opt-in) destructive write/verify fake-capacity tests. Everything is reported over the USB-serial console via a line-based query language (`info`, `caps`, `status`, `scan`, `bench`, `json`, `reinit`, `wtest`) — the board's TFT display is deliberately never touched.
+ESP-IDF firmware that turns a CYD ESP32-2432S032C board into an SD-card diagnosis tool: it sits directly on the SD bus (SPI mode), dumps and decodes every identity register (CID/CSD/SCR/SSR/OCR/CMD6), and runs read benchmarks, surface scans, and (opt-in) destructive write/verify fake-capacity tests. Everything is reported over the USB-serial console via a line-based query language (`info`, `caps`, `status`, `scan`, `bench`, `json`, `reinit`, `wtest`). A standalone LVGL touchscreen UI (`ui.c`, gated by `SDDIAG_UI` in `config.h`) additionally exposes the basic non-destructive functions (Identify, Sniff test) on the board's ST7789 display with GT911 capacitive touch.
 
 Reference docs at the repo root:
 - `IMPLEMENTATION_PLAN.md` — architecture, module specs, milestones.
@@ -52,6 +52,7 @@ All firmware code is in `firmware/main/`, one flat ESP-IDF component:
 - `diag_read.[ch]` — read-only diagnostics: surface scan, sequential/random read benchmark, CMD13 error-flag decode.
 - `diag_write.[ch]` — destructive: full-card write/verify (h2testw-style fake-capacity detection). Entirely compiled out unless `CONFIG_SDDIAG_ALLOW_DESTRUCTIVE=1`.
 - `report.[ch]` — all human-readable and JSON output formatting.
+- `ui.[ch]` — optional LVGL 9 touchscreen UI (Identify / Sniff test buttons), built on managed components (`idf_component.yml`: lvgl, esp_lvgl_port, esp_lcd_touch_gt911) with esp_lcd's native ST7789 driver. UI and serial console share the SD bus through a mutex owned by `app_main.c`. Display/touch pins and orientation flags live in `config.h`.
 
 Hardware pin map (in `config.h`): SD slot on its own SPI bus — CS=GPIO5, MOSI=GPIO23, MISO=GPIO19, SCK=GPIO18, `SPI2_HOST`. Probe clock starts at 400 kHz for marginal cards, 20 MHz nominal.
 
