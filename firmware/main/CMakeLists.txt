@@ -5,6 +5,7 @@ idf_component_register(
         "sd_decode.c"
         "sd_mfg_db.c"
         "diag_read.c"
+        "diag_write.c"
         "report.c"
     INCLUDE_DIRS "."
     REQUIRES

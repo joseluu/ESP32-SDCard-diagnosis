@@ -20,6 +20,7 @@
 #include "sd_hal.h"
 #include "sd_decode.h"
 #include "diag_read.h"
+#include "diag_write.h"
 #include "report.h"
 
 static sd_hal_t   s_hal;
@@ -45,6 +46,9 @@ static void cmd_help(void)
       "  bench    read-only sequential + random read benchmark\n"
       "  json     full machine-readable JSON document\n"
       "  reinit   re-attempt card bring-up\n"
+#if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
+      "  wtest    DESTRUCTIVE full write/verify (overwrites card; needs `wtest DESTROY`)\n"
+#endif
       "  help     this message\n"
       "\nDestructive write tests are %s in this build.\n",
 #if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
@@ -115,6 +119,34 @@ static void cmd_json(void)
     report_json(&s_hal, &s_dec);
 }
 
+#if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
+static void write_progress(int pct)
+{
+    static int last = -1;
+    if (pct / 10 != last / 10) { printf("  ...%d%%\n", pct); last = pct; }
+}
+
+static void cmd_wtest(const char *arg)
+{
+    if (!s_card_ok) { printf("No card. Run `reinit`.\n"); return; }
+    while (*arg == ' ') arg++;
+    if (strcmp(arg, "DESTROY") != 0) {
+        printf("\n*** DESTRUCTIVE write/verify test ***\n");
+        printf("This OVERWRITES THE ENTIRE CARD. ALL DATA WILL BE LOST.\n");
+        printf("It writes a per-sector pattern over every sector, then reads the\n");
+        printf("whole card back to verify retention and detect fake capacity.\n");
+        printf("To proceed, run:  wtest DESTROY\n");
+        return;
+    }
+    printf("\n=== DESTRUCTIVE WRITE/VERIFY (h2testw-style) ===\n");
+    printf("Overwriting and verifying the whole card. This takes many minutes.\n");
+    write_result_t res;
+    esp_err_t e = diag_write_verify(&s_hal, &res, write_progress);
+    if (e != ESP_OK) { printf("wtest error: %s\n", esp_err_to_name(e)); return; }
+    report_write_human(&res);
+}
+#endif
+
 static void cmd_reinit(void)
 {
     printf("Re-initialising card...\n");
@@ -143,6 +175,9 @@ static void dispatch(char *line)
     else if (!strcmp(line, "bench"))  cmd_bench();
     else if (!strcmp(line, "json"))   cmd_json();
     else if (!strcmp(line, "reinit")) cmd_reinit();
+#if CONFIG_SDDIAG_ALLOW_DESTRUCTIVE
+    else if (!strncmp(line, "wtest", 5)) cmd_wtest(line + 5);
+#endif
     else printf("Unknown command '%s'. Type `help`.\n", line);
 
     printf("\nsd> ");
