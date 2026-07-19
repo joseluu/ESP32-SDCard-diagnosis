@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ESP-IDF firmware that turns a CYD ESP32-2432S032C board into an SD-card diagnosis tool: it sits directly on the SD bus (SPI mode), dumps and decodes every identity register (CID/CSD/SCR/SSR/OCR/CMD6), and runs read benchmarks, surface scans, and (opt-in) destructive write/verify fake-capacity tests. Everything is reported over the USB-serial console via a line-based query language (`info`, `caps`, `status`, `scan [lba [n]]`, `bench`, `sniff`, `read <lba> [n]`, `json`, `reinit`, `capcheck`, `wtest`; long tests stop cleanly on any input and can resume via a range scan). A standalone LVGL touchscreen UI (`ui.c`, gated by `SDDIAG_UI` in `config.h`) additionally exposes the basic non-destructive functions (Identify, Sniff test) on the board's ST7789 display with GT911 capacitive touch.
 
 Reference docs at the repo root:
-- `IMPLEMENTATION_PLAN.md` — architecture, module specs, milestones.
+- `README.md` — project scope, feature comparison vs Linux `rtsx_pci`, interfaces, hardware, safety model, and possible future work.
 - `SD_REFERENCE.md` — bit-level register layouts, decode tables, manufacturer-ID database. Follow this when writing/altering any decode logic.
 
 ## Building and flashing

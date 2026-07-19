@@ -8,8 +8,8 @@
 //     SD_MISO = GPIO19
 //     SD_SCK  = GPIO18
 //
-// We deliberately do NOT touch the TFT/display at all (per project requirement:
-// report everything over serial, no display facility).
+// The serial console is the primary interface; the optional LVGL touchscreen
+// UI below (SDDIAG_UI) additionally drives the TFT/GT911 for standalone use.
 
 #pragma once
 
