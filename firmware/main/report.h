@@ -5,7 +5,9 @@
 #include "diag_read.h"
 
 // Identity / capabilities / health, grouped human-readable block.
-void report_identity_human(const sd_hal_t *h, const sd_decoded_t *d);
+// Note: non-const — this actively probes CMD56 (GEN_CMD) as part of the
+// report, not just reading previously-captured state.
+void report_identity_human(sd_hal_t *h, const sd_decoded_t *d);
 void report_caps_human(const sd_decoded_t *d);
 
 // Surface scan / benchmark / quick-probe results.

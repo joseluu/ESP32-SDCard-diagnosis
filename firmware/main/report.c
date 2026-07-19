@@ -27,7 +27,7 @@ static const char *speed_class_str(uint8_t c)
     }
 }
 
-void report_identity_human(const sd_hal_t *h, const sd_decoded_t *d)
+void report_identity_human(sd_hal_t *h, const sd_decoded_t *d)
 {
     const sd_raw_t *raw = &h->raw;
     printf("\n=== IDENTITY (raw registers, MSB-first, matches Linux sysfs) ===\n");
@@ -73,6 +73,23 @@ void report_identity_human(const sd_hal_t *h, const sd_decoded_t *d)
     }
     printf("  Negotiated bus    : %s, %d-bit, %d kHz\n",
            h->backend, h->bus_width, h->freq_khz);
+
+    // CMD56 (GEN_CMD): vendor-specific health/SMART block. The SD spec does
+    // not standardise this command's existence or payload — most consumer
+    // cards reject it outright. No vendor decode table exists here, so a
+    // successful read is shown as raw hex (first bytes) rather than parsed.
+    {
+        uint8_t gc[512];
+        esp_err_t ge = sd_hal_read_gen_cmd(h, gc);
+        if (ge == ESP_OK) {
+            printf("  CMD56 (vendor health): supported — raw (first 32B): ");
+            for (int i = 0; i < 32; i++) printf("%02x", gc[i]);
+            printf("...\n");
+        } else {
+            printf("  CMD56 (vendor health): not supported (%s)\n",
+                   esp_err_to_name(ge));
+        }
+    }
 
     // Cross-check against IDF's own decode (authoritative) to validate parsing.
     printf("  [IDF decode] mfg=0x%02x oem=0x%04x name=\"%.7s\" rev=0x%x "

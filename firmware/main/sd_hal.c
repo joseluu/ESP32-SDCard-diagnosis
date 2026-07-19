@@ -25,6 +25,7 @@
 #define OP_SWITCH_FUNC  6    // CMD6
 #define OP_SD_STATUS    13   // ACMD13 (after CMD55)
 #define OP_SEND_SCR     51   // ACMD51
+#define OP_GEN_CMD      56   // CMD56 (vendor-specific, read direction)
 
 static void note_err(sd_hal_t *h, const char *stage, esp_err_t e)
 {
@@ -213,6 +214,29 @@ esp_err_t sd_hal_switch_func_check(sd_hal_t *h, uint8_t status64[64])
     };
     esp_err_t e = sdmmc_send_cmd(&h->card, &cmd);
     if (e == ESP_OK) memcpy(status64, buf, 64);
+    heap_caps_free(buf);
+    return e;
+}
+
+esp_err_t sd_hal_read_gen_cmd(sd_hal_t *h, uint8_t data512[512])
+{
+    if (!h->initialized) return ESP_ERR_INVALID_STATE;
+    uint8_t *buf = heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!buf) return ESP_ERR_NO_MEM;
+    // CMD56 GEN_CMD: arg bit0 = 0 selects the read direction (card -> host).
+    // No standard payload; the SD spec leaves the 512-byte block entirely to
+    // the vendor. Most consumer cards simply reject the opcode.
+    sdmmc_command_t cmd = {
+        .opcode = OP_GEN_CMD,
+        .arg = 0,
+        .data = buf,
+        .datalen = 512,
+        .buflen = heap_caps_get_allocated_size(buf),
+        .blklen = 512,
+        .flags = SCF_CMD_READ | SCF_CMD_ADTC | SCF_RSP_R1,
+    };
+    esp_err_t e = sdmmc_send_cmd(&h->card, &cmd);
+    if (e == ESP_OK) memcpy(data512, buf, 512);
     heap_caps_free(buf);
     return e;
 }

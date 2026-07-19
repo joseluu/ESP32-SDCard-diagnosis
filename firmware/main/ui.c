@@ -109,6 +109,19 @@ static void fmt_identity(void)
          csd->capacity_bytes / 1e9, (unsigned long long)csd->capacity_sectors);
     outf("Bus     : %s %d-bit @ %d kHz\n", s_ctx.hal->backend,
          s_ctx.hal->bus_width, s_ctx.hal->freq_khz);
+
+    // CMD56 (GEN_CMD): vendor-specific health/SMART block, best-effort. Most
+    // consumer cards reject it; no vendor decode exists so a success just
+    // shows the first bytes as hex.
+    uint8_t gc[512];
+    esp_err_t ge = sd_hal_read_gen_cmd(s_ctx.hal, gc);
+    if (ge == ESP_OK) {
+        outf("CMD56   : supported\n  ");
+        for (int i = 0; i < 16; i++) outf("%02x", gc[i]);
+        outf("...\n");
+    } else {
+        outf("CMD56   : not supported\n");
+    }
 }
 
 static void fmt_caps(void)

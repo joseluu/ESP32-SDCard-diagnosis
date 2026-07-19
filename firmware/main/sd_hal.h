@@ -50,3 +50,11 @@ esp_err_t sd_hal_switch_func_check(sd_hal_t *h, uint8_t status64[64]);
 
 // ACMD13 SD_STATUS (SSR), 64-byte data block.
 esp_err_t sd_hal_read_ssr(sd_hal_t *h, uint8_t ssr64[64]);
+
+// CMD56 GEN_CMD, read direction (arg bit0=0): a 512-byte vendor-defined data
+// block used by some industrial cards (ATP, Swissbit, Apacer...) to report
+// health (spare-block %, erase counts, power cycles). The SD spec does not
+// standardise the payload format or even require the command to exist on any
+// given card — on consumer cards it is expected to come back
+// ESP_ERR_NOT_SUPPORTED (illegal command). Best-effort: no vendor decode.
+esp_err_t sd_hal_read_gen_cmd(sd_hal_t *h, uint8_t data512[512]);
